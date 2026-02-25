@@ -100,8 +100,9 @@ class PaliGemmaWithExpertModel(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
+            prefix_input = inputs_embeds[0].clone() if isinstance(inputs_embeds[0], torch.Tensor) else inputs_embeds[0]
             prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
+                inputs_embeds=prefix_input,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -112,8 +113,9 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            suffix_input = inputs_embeds[1].clone() if isinstance(inputs_embeds[1], torch.Tensor) else inputs_embeds[1]
             suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
+                inputs_embeds=suffix_input,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -124,6 +126,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
+            # Clone all elements of inputs_embeds to avoid CUDAGraphs overwrite errors
+            inputs_embeds = [x.clone() if isinstance(x, torch.Tensor) else x for x in inputs_embeds]
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
@@ -198,6 +202,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
                 # Attention computation
+                if attention_mask is not None and attention_mask.dtype != query_states.dtype:
+                    attention_mask = attention_mask.to(query_states.dtype)
                 att_output, _ = modeling_gemma.eager_attention_forward(
                     self.paligemma.language_model.layers[layer_idx].self_attn,
                     query_states,

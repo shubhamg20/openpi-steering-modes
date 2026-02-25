@@ -429,6 +429,8 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
     Example data config for custom DROID dataset in LeRobot format.
     To convert your custom DROID dataset (<10s of hours) to LeRobot format, see examples/droid/convert_droid_data_to_lerobot.py
     """
+    # Default prompt to use if not provided in dataset
+    default_prompt: str = ""
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -437,19 +439,22 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
                 _transforms.RepackTransform(
                     {
                         "observation/exterior_image_1_left": "exterior_image_1_left",
-                        "observation/exterior_image_2_left": "exterior_image_2_left",
+                        # "observation/exterior_image_2_left": "exterior_image_2_left",
                         "observation/wrist_image_left": "wrist_image_left",
                         "observation/joint_position": "joint_position",
                         "observation/gripper_position": "gripper_position",
                         "actions": "actions",
-                        "prompt": "prompt",
+                        # "prompt": "prompt",
                     }
                 )
             ]
         )
         # We assume joint *velocity* actions, so we should *not* apply an additional delta transform.
         data_transforms = _transforms.Group(
-            inputs=[droid_policy.DroidInputs(model_type=model_config.model_type)],
+            inputs=[
+                _transforms.InjectDefaultPrompt(self.default_prompt),
+                droid_policy.DroidInputs(model_type=model_config.model_type)
+            ],
             outputs=[droid_policy.DroidOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
@@ -461,6 +466,60 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+@dataclasses.dataclass(frozen=True)
+class ActDroidDataConfig(DataConfigFactory):
+    """
+    Config for training on Franka, using Act format.
+    """
+
+    use_delta_actions: bool = False
+    base_image: str | None = None
+    wrist_image: str | None = None
+    default_prompt: str = ""
+
+    def __post_init__(self):
+        remappings = {}
+        remappings["observation/gripper_position"] = "observation.gripper_position"        
+        remappings["observation/joint_position"] = "observation.joint_position"
+        remappings["observation/human_traj"] = "observation.human_traj"
+        remappings["task_name"] = "task_name"
+        remappings["actions"] = "action"
+        remappings["action_is_pad"] = "action_is_pad"
+        image_keys = [self.base_image, self.wrist_image]
+        image_keys = [image_key for image_key in image_keys if image_key is not None]
+        object.__setattr__(self, "image_keys", image_keys)
+        for image_key in image_keys:
+            remappings[f"observation/{image_key}"] = f"observation.images.{image_key}"
+        object.__setattr__(
+            self, "repack_transform", _transforms.Group(inputs=[_transforms.RepackTransform(remappings)])
+        )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        base_config = self.create_base_config(assets_dirs, model_config)
+        # dataset_metadata = base_config.dataset_metadata
+        data_transforms = _transforms.Group(
+            inputs=[
+                droid_policy.DroidInputs(
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[droid_policy.DroidOutputs()],
+        )
+        if self.use_delta_actions:
+            delta_action_mask = _transforms.make_bool_mask(droid_policy.NUM_ACTIONS)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=self.repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
@@ -891,6 +950,56 @@ _CONFIGS = [
         save_interval=5000,
         keep_period=10_000,
         num_workers=0,  # Important: RLDS DataLoader requires num_workers=0, handles multi-processing internally
+    ),
+    TrainConfig(
+        # This config is for fine-tuning pi0 DROID on a custom (smaller) DROID dataset with LoRA.
+        # Low-memory finetuning approach using LoRA adapters.
+        name="pi0_droid_lora_finetune",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ),
+        data=ActDroidDataConfig(
+            # Replace with your custom DROID LeRobot dataset repo id.
+            repo_id="shubhamg20/custom_three_tasks",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                # Important: reuse the original DROID norm stats during fine-tuning!
+                assets_dir="gs://openpi-assets/checkpoints/pi0_droid/assets",
+                asset_id="droid",
+            ),
+            use_delta_actions=False,
+            base_image="exterior_image_1_left",
+            wrist_image="wrist_image_left",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_droid/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,  # Turn off EMA for LoRA finetuning
+        num_train_steps=10_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        # This config is for fine-tuning pi0 DROID on a custom (smaller) DROID dataset with LoRA.
+        # Low-memory finetuning approach using LoRA adapters.
+        name="pi0_droid_lora_finetune_data",
+        data=ActDroidDataConfig(
+            repo_id="shubhamg20/custom_three_tasks",
+            assets=AssetsConfig(
+                assets_dir="assets_sft",
+                asset_id="90_three_tasks",
+            ),
+            use_delta_actions=False,
+            base_image="exterior_image_1_left",
+            wrist_image="wrist_image_left",
+        ),
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=16),
     ),
     TrainConfig(
         # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.

@@ -100,7 +100,6 @@ class RepackTransform(DataTransformFn):
         flat_item = flatten_dict(data)
         return jax.tree.map(lambda k: flat_item[k], self.structure)
 
-
 @dataclasses.dataclass(frozen=True)
 class InjectDefaultPrompt(DataTransformFn):
     prompt: str | None
@@ -126,7 +125,6 @@ class Normalize(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         if self.norm_stats is None:
             return data
-
         return apply_tree(
             data,
             self.norm_stats,
@@ -248,10 +246,15 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    # If True, allows missing prompts and uses empty string as default
+    allow_null_prompt: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
-            raise ValueError("Prompt is required")
+            if self.allow_null_prompt:
+                prompt = ""
+            else:
+                raise ValueError("Prompt is required")
 
         if self.discrete_state_input:
             if (state := data.get("state", None)) is None:
@@ -261,7 +264,6 @@ class TokenizePrompt(DataTransformFn):
 
         if not isinstance(prompt, str):
             prompt = prompt.item()
-
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 

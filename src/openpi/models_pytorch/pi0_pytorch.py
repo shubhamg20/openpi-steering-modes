@@ -1,5 +1,7 @@
+from collections.abc import MutableMapping
 import logging
 import math
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -9,6 +11,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.transformers_replace.models.siglip import check
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -49,6 +52,37 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
+def make_dct_basis(horizon: int, k: int, device, dtype=torch.float32) -> torch.Tensor:
+    """
+    Orthonormal DCT-II basis matrix B of shape (H, K).
+    """
+    H = int(horizon)
+    K = int(k)
+    t = torch.arange(H, device=device, dtype=dtype).view(H, 1)  # (H,1)
+    kk = torch.arange(K, device=device, dtype=dtype).view(1, K)  # (1,K)
+
+    B = torch.cos((math.pi / H) * (t + 0.5) * kk)  # (H,K)
+
+    # Orthonormal scaling
+    B[:, 0] *= math.sqrt(1.0 / H)
+    if K > 1:
+        B[:, 1:] *= math.sqrt(2.0 / H)
+    return B
+
+
+def expand_blocks(c: torch.Tensor, horizon: int) -> torch.Tensor:
+    """Expand K block parameters across the horizon by repetition."""
+    k = c.shape[-2]
+    block = max(1, horizon // k)
+    expanded = torch.repeat_interleave(c, repeats=block, dim=-2)
+    current = expanded.shape[-2]
+    if current < horizon:
+        pad_len = horizon - current
+        pad = c[..., -1:, :].expand(*expanded.shape[:-2], pad_len, c.shape[-1])
+        expanded = torch.cat([expanded, pad], dim=-2)
+    return expanded[..., :horizon, :]
+
+
 def make_att_2d_masks(pad_masks, att_masks):
     """Copied from big_vision.
 
@@ -82,7 +116,7 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, compile_mode: str | None = "max-autotune"):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
@@ -90,16 +124,29 @@ class PI0Pytorch(nn.Module):
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
+        # Clear GPU memory before model creation to help with CUDA graph recording
+        torch.cuda.empty_cache()
+
+        paligemma_model = PaliGemmaWithExpertModel(
             paligemma_config,
             action_expert_config,
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
 
+        if compile_mode == "max-autotune":
+            self.paligemma_with_expert = torch.compile(
+                paligemma_model,
+                mode=compile_mode,
+                fullgraph=True,
+            )
+            logging.info("torch.compile enabled for paligemma_with_expert (mode: %s)", compile_mode)
+        else:
+            self.paligemma_with_expert = paligemma_model
+            logging.info("torch.compile disabled for paligemma_with_expert")
+
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
-
         if self.pi05:
             self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
             self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -109,54 +156,100 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
 
-        # Initialize gradient checkpointing flag
+        if compile_mode is not None:
+            if compile_mode == "max-autotune-no-gemm":
+                # This is a custom compile mode that fits into weak GPUs such as RTX 6000 ada.
+                self.sample_actions = torch.compile(
+                    self.sample_actions,
+                    backend="inductor",
+                    options={
+                        # Note: we're still applying default options, e.g., triton.cudagraphs: True
+                        "max_autotune": True,  # Optimize pointwise/reduction ops (Safe)
+                        "max_autotune_gemm": False,  # Explicitly DISABLE the memory-hungry GEMM tuner
+                    },
+                )
+            else:
+                self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)
+            logging.info("torch.compile enabled for sample_actions (mode: %s)", compile_mode)
+        else:
+            self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)
+        # Gradient checkpointing is intentionally disabled in this fast variant.
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
-        try:
-            from transformers.models.siglip import check
+        if not check.check_whether_transformers_replace_is_installed_correctly():
+            raise ValueError("transformers_replace is not set up correctly.")
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+    def _state_dict_has_paligemma_orig_mod(self, state_dict: MutableMapping[str, Any]) -> bool:
+        paligemma_orig_prefix = "paligemma_with_expert._orig_mod."
+        return any(key.startswith(paligemma_orig_prefix) for key in state_dict)
+
+    def _convert_paligemma_state_dict_keys(
+        self, state_dict: MutableMapping[str, Any], *, insert_orig_mod: bool
+    ) -> MutableMapping[str, Any]:
+        paligemma_prefix = "paligemma_with_expert."
+        paligemma_orig_prefix = f"{paligemma_prefix}_orig_mod."
+        converted_state_dict = state_dict.__class__()  # Preserve ordered dicts
+        for key, value in state_dict.items():
+            new_key = key
+            if insert_orig_mod:
+                if key.startswith(paligemma_prefix) and not key.startswith(paligemma_orig_prefix):
+                    suffix = key[len(paligemma_prefix) :]
+                    new_key = f"{paligemma_orig_prefix}{suffix}"
+            elif key.startswith(paligemma_orig_prefix):
+                suffix = key[len(paligemma_orig_prefix) :]
+                new_key = f"{paligemma_prefix}{suffix}"
+            converted_state_dict[new_key] = value
+        return converted_state_dict
+
+    def load_state_dict(
+        self, state_dict: MutableMapping[str, Any], *, strict: bool = True, assign: bool = False
+    ) -> Any:
+        expects_orig_mod = hasattr(self.paligemma_with_expert, "_orig_mod")
+        state_has_orig_mod = self._state_dict_has_paligemma_orig_mod(state_dict)
+        converted_state_dict = state_dict
+        if expects_orig_mod and not state_has_orig_mod:
+            converted_state_dict = self._convert_paligemma_state_dict_keys(state_dict, insert_orig_mod=True)
+        elif not expects_orig_mod and state_has_orig_mod:
+            converted_state_dict = self._convert_paligemma_state_dict_keys(state_dict, insert_orig_mod=False)
+        return super().load_state_dict(converted_state_dict, strict=strict, assign=assign)
 
     def gradient_checkpointing_enable(self):
-        """Enable gradient checkpointing for memory optimization."""
-        self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
-
-        logging.info("Enabled gradient checkpointing for PI0Pytorch model")
+        """No-op placeholder to maintain interface compatibility."""
+        logging.info("PI0PytorchFast ignores gradient checkpointing requests.")
+        self.gradient_checkpointing_enabled = False
 
     def gradient_checkpointing_disable(self):
-        """Disable gradient checkpointing."""
+        """Ensure gradient checkpointing stays disabled."""
+        logging.info("PI0PytorchFast keeps gradient checkpointing disabled.")
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
-
-        logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
     def is_gradient_checkpointing_enabled(self):
-        """Check if gradient checkpointing is enabled."""
-        return self.gradient_checkpointing_enabled
+        """Fast variant never enables checkpointing."""
+        return False
 
-    def _apply_checkpoint(self, func, *args, **kwargs):
-        """Helper method to apply gradient checkpointing if enabled."""
-        if self.gradient_checkpointing_enabled and self.training:
-            return torch.utils.checkpoint.checkpoint(
-                func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs
-            )
-        return func(*args, **kwargs)
+    def _select_attention_backend(self):
+        """Pick the fastest available attention backend (prefers torch SDPA/flash on GPU)."""
+        return "eager" if torch.cuda.is_available() else "eager"
 
+    def _set_attention_backend(self, *, use_expert: bool):
+        backend = self._select_attention_backend()
+        target_config = (
+            self.paligemma_with_expert.gemma_expert.model.config
+            if use_expert
+            else self.paligemma_with_expert.paligemma.language_model.config
+        )
+        target_config._attn_implementation = backend  # noqa: SLF001
+
+    ##### DATA DEPENDENT FUNCTION ######
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        # Create mask in the model's dtype (e.g., bfloat16) to match query dtype in attention
+        model_dtype = self.state_proj.weight.dtype
+        zero = torch.tensor(0.0, dtype=model_dtype, device=att_2d_masks.device)
+        neg_inf = torch.tensor(-2.3819763e38, dtype=model_dtype, device=att_2d_masks.device)
+        return torch.where(att_2d_masks_4d, zero, neg_inf)
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -193,29 +286,17 @@ class PI0Pytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
-
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
-
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-
+            img_emb = self.paligemma_with_expert.embed_image(img)
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
 
-        # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
-
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+        lang_emb_dim = lang_emb.shape[-1]
+        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -241,23 +322,15 @@ class PI0Pytorch(nn.Module):
         att_masks = []
 
         if not self.pi05:
-            if self.state_proj.weight.dtype == torch.float32:
-                state = state.to(torch.float32)
+            # Convert state to match the model's dtype (e.g., bfloat16 or float32)
+            state = state.to(self.state_proj.weight.dtype)
 
-            # Embed state
-            def state_proj_func(state):
-                return self.state_proj(state)
-
-            state_emb = self._apply_checkpoint(state_proj_func, state)
-
+            state_emb = self.state_proj(state)
             embs.append(state_emb[:, None, :])
-            bsize = state_emb.shape[0]
+            state_batch = state_emb.shape[0]
             device = state_emb.device
-
-            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+            state_mask = torch.ones(state_batch, 1, dtype=torch.bool, device=device)
             pad_masks.append(state_mask)
-
-            # Set attention masks so that image and language inputs do not attend to state or actions
             att_masks += [1]
 
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
@@ -267,32 +340,20 @@ class PI0Pytorch(nn.Module):
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
-        def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
-
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+        action_emb = self.action_in_proj(noisy_actions)
 
         if not self.pi05:
             time_emb = time_emb[:, None, :].expand_as(action_emb)
             action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-
-            # Apply MLP layers
-            def mlp_func(action_time_emb):
-                x = self.action_time_mlp_in(action_time_emb)
-                x = F.silu(x)  # swish == silu
-                return self.action_time_mlp_out(x)
-
-            action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+            action_time_emb = self.action_time_mlp_in(action_time_emb)
+            action_time_emb = F.silu(action_time_emb)
+            action_time_emb = self.action_time_mlp_out(action_time_emb)
             adarms_cond = None
         else:
-            # time MLP (for adaRMS)
-            def time_mlp_func(time_emb):
-                x = self.time_mlp_in(time_emb)
-                x = F.silu(x)  # swish == silu
-                x = self.time_mlp_out(x)
-                return F.silu(x)
-
-            time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            x = self.time_mlp_in(time_emb)
+            x = F.silu(x)  # swish == silu
+            x = self.time_mlp_out(x)
+            time_emb = F.silu(x)
             action_time_emb = action_emb
             adarms_cond = time_emb
 
@@ -328,13 +389,20 @@ class PI0Pytorch(nn.Module):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs = prefix_embs.clone()
+        # Ensure dtype matches model weights (bfloat16 or float32)
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -345,32 +413,29 @@ class PI0Pytorch(nn.Module):
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        # Apply gradient checkpointing if enabled
-        def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        torch.compiler.cudagraph_mark_step_begin()
+        paligemma_outputs, _ = self.paligemma_with_expert.forward(
+            attention_mask=att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=adarms_cond,
         )
-
+        suffix_out = paligemma_outputs[1].clone()
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
+        v_t = self.action_out_proj(suffix_out)
 
-        # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
-
-        return F.mse_loss(u_t, v_t, reduction="none")
+        # B, T, A
+        loss = F.mse_loss(u_t, v_t, reduction="none")
+        if observation.action_is_pad is not None:
+            # B, T, 1
+            action_is_not_pad = (~observation.action_is_pad).float().unsqueeze(-1)
+            loss = loss * action_is_not_pad
+            # B, 1, A
+            loss = loss.sum(1, keepdim=True) / action_is_not_pad.sum(1, keepdim=True)
+        return loss
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
@@ -379,17 +444,19 @@ class PI0Pytorch(nn.Module):
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
-
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs = prefix_embs.clone()
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # Compute image and language key value cache
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self._set_attention_backend(use_expert=False)
 
+        torch.compiler.cudagraph_mark_step_begin()
+        torch.compiler.cudagraph_mark_step_begin()
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -412,11 +479,285 @@ class PI0Pytorch(nn.Module):
                 x_t,
                 expanded_time,
             )
-
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
         return x_t
+
+    @torch.no_grad()
+    def sample_noise_action(self, device, observation, action, num_steps=10) -> Tensor:
+        """Do a full inference backward and compute the noise (batch_size x num_steps x num_motors)"""
+        # print("sample noise action called")
+        bsize = observation.state.shape[0]
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs = prefix_embs.clone()
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self._set_attention_backend(use_expert=False)
+
+        torch.compiler.cudagraph_mark_step_begin()
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        dt = 1.0 / num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+        x_t = action
+        time = torch.tensor(0.0, dtype=torch.float32, device=device)
+        while time < 1 - dt / 2:
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+            )
+            # Euler step - use new tensor assignment instead of in-place operation
+            x_t = x_t + dt * v_t
+            time += dt
+        return x_t
+
+    @torch.no_grad()
+    def sample_noise_action_implicit(
+        self,
+        device,
+        observation,
+        action,
+        num_steps: int = 10,
+        num_fp_iters: int = 8,
+        tol: float | None = None,
+    ) -> torch.Tensor:
+        """
+        Invert the flow: Action (t=0) -> Noise (t=1) using implicit Euler
+        with fixed-point iteration.
+        """
+        bsize = observation.state.shape[0]
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs = prefix_embs.clone()
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+
+        # Compute image and language key value cache
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self._set_attention_backend(use_expert=False)
+
+        torch.compiler.cudagraph_mark_step_begin()
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        # === implicit Euler, your tensor loop style ===
+        dt = 1.0 / num_steps
+        dt = torch.tensor(dt, dtype=torch.float32, device=device)
+
+        x_t = action
+        time = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+        while time < 1 - dt/2:
+            # next time is a tensor too
+            t_next = (time + dt).expand(bsize)
+
+            # fixed-point iteration to solve x_new = x_t + dt*v(x_new, t_next)
+            x_new = x_t.clone()
+            for i in range(num_fp_iters):
+                x_prev = x_new
+                torch.compiler.cudagraph_mark_step_begin()
+                v_t = self.denoise_step(
+                    state,
+                    prefix_pad_masks,
+                    past_key_values,
+                    x_new,
+                    t_next,    # NOTE: implicit uses t_next, not time
+                )
+                v_t = v_t.clone()
+                x_new = x_t + dt * v_t
+
+                if tol is not None:
+                    diff = (x_new - x_prev).abs().max()
+                    if diff.item() < tol:
+                        break
+            x_t = x_new
+            time = time + dt     # tensor update keeps your style
+        return x_t
+
+    @torch.no_grad()
+    def cem_fit_noise_blocks(self,
+        sample_actions_fn,
+        actions_true: torch.Tensor,  # (H, A)
+        *,
+        c_init: torch.Tensor | None = None,
+        true_action_dim: int = 14,
+        action_dim: int = 32,
+        horizon: int = 50,
+        k_blocks: int = 1,
+        iters: int = 50,
+        pop: int = 128,
+        elites: int = 16,
+        init_std: float = 0.5,
+        min_std: float = 0.05,
+        alpha: float = 0.25,
+        verbose: bool = False,
+        device: str | torch.device,
+    ) -> tuple[torch.Tensor, float]:
+        """0th-order CEM search over block-parameterized noise."""
+        actions_true = actions_true.to(device)
+
+        if c_init is None:
+            mean = torch.zeros(k_blocks, action_dim, device=device)
+        else:
+            mean = c_init.to(device).clone()
+        std = torch.ones_like(mean) * init_std
+
+        best_loss = float("inf")
+        best_c = mean.clone()
+
+        for i in range(iters):
+            eps = torch.randn(pop, k_blocks, action_dim, device=device)
+            c = mean[None] + std[None] * eps
+
+            # Keep current mean as a candidate for stability.
+            c[0] = mean
+
+            noise = expand_blocks(c, horizon)  # (pop, H, A)
+            actions_hat = sample_actions_fn(noise)  # (pop, H, A)
+
+            loss = (
+                (actions_hat[..., :true_action_dim] - actions_true[None, :, :true_action_dim]) ** 2
+            ).mean(dim=(1, 2))
+
+            elite_idx = torch.topk(-loss, k=elites).indices
+            c_elite = c[elite_idx]
+
+            min_i = torch.argmin(loss)
+            loss_min_val = float(loss[min_i])
+            if loss_min_val < best_loss:
+                best_loss = loss_min_val
+                best_c = c[min_i].clone()
+
+            new_mean = c_elite.mean(dim=0)
+            new_std = c_elite.std(dim=0).clamp_min(min_std)
+
+            mean = (1 - alpha) * mean + alpha * new_mean
+            std = (1 - alpha) * std + alpha * new_std
+
+        if verbose:
+            print(
+                f"[cem] iter={i:02d} best_loss={best_loss:.6f} "
+                f"elite_loss={loss_min_val:.6f} std_mean={std.mean().item():.4f}"
+            )
+
+        best_noise = expand_blocks(best_c[None], horizon)[0]
+        return best_noise, best_loss
+
+    @torch.no_grad()
+    def cem_fit_noise_dct_coeff(
+        self,
+        sample_actions_fn,
+        actions_true: torch.Tensor,  # (H, A)
+        *,
+        c_init: torch.Tensor | None = None,  # (K, A)
+        true_action_dim: int = 14,
+        action_dim: int = 32,
+        horizon: int = 50,
+        k_dct: int = 12,
+        iters: int = 30,
+        pop: int = 128,
+        elites: int = 16,
+        init_std: float = 0.5,
+        min_std: float = 0.05,
+        alpha: float = 0.25,
+        verbose: bool = False,
+        device: str | torch.device = "cuda",
+    ) -> tuple[torch.Tensor, float, torch.Tensor]:
+        """
+        CEM over low-dim DCT coefficients C (K x A), where noise trajectory is:
+            N(H x A) = B(H x K) @ C(K x A)
+        """
+        device = torch.device(device) if isinstance(device, str) else device
+
+        if actions_true.ndim != 2:
+            raise ValueError(f"actions_true must be (H,A). Got {tuple(actions_true.shape)}")
+        actions_true = actions_true.to(device)
+
+        K = int(k_dct)
+        H = int(horizon)
+        A = int(action_dim)
+
+        # Precompute basis once (float32 is fine; noise is float32 anyway in your sampler)
+        B = make_dct_basis(H, K, device=device, dtype=torch.float32)  # (H,K)
+
+        if c_init is None:
+            mean = torch.zeros(K, A, device=device)
+        else:
+            if c_init.shape != (K, A):
+                raise ValueError(f"c_init must be (K,A)=({K},{A}), got {tuple(c_init.shape)}")
+            mean = c_init.to(device).clone()
+
+        std = torch.ones_like(mean) * float(init_std)
+
+        best_loss = float("inf")
+        best_C = mean.clone()
+
+        for it in range(int(iters)):
+            eps = torch.randn(pop, K, A, device=device)
+            C = mean[None] + std[None] * eps  # (pop,K,A)
+
+            # Keep current mean as candidate for stability
+            C[0] = mean
+
+            # Build noise: N = B @ C -> (pop,H,A)
+            noise = torch.matmul(B, C)
+
+            # Decode actions with frozen Pi0 (wrapped)
+            actions_hat = sample_actions_fn(noise)  # (pop,H,A)
+
+            # Loss only on real action dims
+            loss = ((actions_hat[..., :true_action_dim] - actions_true[None, :, :true_action_dim]) ** 2).mean(
+                dim=(1, 2)
+            )  # (pop,)
+
+            # Track best sample
+            min_i = torch.argmin(loss)
+            loss_min = float(loss[min_i])
+            if loss_min < best_loss:
+                best_loss = loss_min
+                best_C = C[min_i].clone()
+
+            # Elite update
+            elite_idx = torch.topk(-loss, k=int(elites)).indices
+            C_elite = C[elite_idx]
+            new_mean = C_elite.mean(dim=0)
+            new_std = C_elite.std(dim=0).clamp_min(float(min_std))
+
+            mean = (1 - float(alpha)) * mean + float(alpha) * new_mean
+            std = (1 - float(alpha)) * std + float(alpha) * new_std
+
+            if verbose:
+                print(
+                    f"[cem-dct] it={it:02d} best={best_loss:.6f} "
+                    f"elite_best={loss_min:.6f} std_mean={std.mean().item():.4f}"
+                )
+
+        best_noise = torch.matmul(B, best_C)  # (H,A)
+        return best_noise, best_loss, best_C
 
     def denoise_step(
         self,
@@ -444,8 +785,9 @@ class PI0Pytorch(nn.Module):
 
         # Prepare attention masks
         full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        self._set_attention_backend(use_expert=True)
 
+        torch.compiler.cudagraph_mark_step_begin()
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
@@ -455,7 +797,7 @@ class PI0Pytorch(nn.Module):
             adarms_cond=[None, adarms_cond],
         )
 
-        suffix_out = outputs_embeds[1]
+        suffix_out = outputs_embeds[1].clone()
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)

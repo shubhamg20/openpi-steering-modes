@@ -242,7 +242,7 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        model = pi0_pytorch.PI0Pytorch(config=train_config.model, compile_mode=None)
         safetensors.torch.load_model(model, weight_path)
         return model
 
