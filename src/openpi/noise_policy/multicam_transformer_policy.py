@@ -408,15 +408,15 @@ class ObservationEncoder(nn.Module):
 
         if not isinstance(images, Mapping):
             raise TypeError(f"images must be Mapping, got {type(images)}")
-        if not isinstance(state, torch.Tensor):
-            raise TypeError(f"state must be torch.Tensor, got {type(state)}")
-        if state.ndim == 1:
-            state = state.unsqueeze(0)
-        if self.conditioning == "keypoints":
-            if state.shape[-1] != self.state_dim:
-                raise ValueError(
-                    f"Expected state last dim={self.state_dim}, got {tuple(state.shape)}"
-                )
+        # if not isinstance(state, torch.Tensor):
+        #     raise TypeError(f"state must be torch.Tensor, got {type(state)}")
+        # if state.ndim == 1:
+        #     state = state.unsqueeze(0)
+        # if self.conditioning == "keypoints":
+        #     if state.shape[-1] != self.state_dim:
+        #         raise ValueError(
+        #             f"Expected state last dim={self.state_dim}, got {tuple(state.shape)}"
+        #         )
         return images, state, task_name
 
     def forward(self, observation: Any) -> torch.Tensor:

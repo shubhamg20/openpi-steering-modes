@@ -70,7 +70,8 @@ class DroidInputs(transforms.DataTransformFn):
             if isinstance(data["prompt"], bytes):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
-
+        if "noise" in data:
+            inputs["noise"] = data["noise"]
         return inputs
 
 

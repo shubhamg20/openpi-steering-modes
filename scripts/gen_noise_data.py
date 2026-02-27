@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data_root",
-        default=os.environ.get("ACT_DATA_ROOT", "/gscratch/weirdlab/shubham2/IsaacLab/source/recorded_runs/data_paired"),
+        default=os.environ.get("ACT_DATA_ROOT", "/gscratch/weirdlab/shubham2/IsaacLab/source/recorded_runs/data_paired_droid"),
         help="Override ACT_DATA_ROOT for loading the dataset.",
     )
     parser.add_argument(
@@ -465,7 +465,7 @@ def main() -> None:
 
     dataset = ActDataset(
         root_dir=args.data_root,
-        action_horizon=16
+        action_horizon=10
     )
     episode_paths = dataset.episode_paths
     episode_lengths = dataset.episode_lengths

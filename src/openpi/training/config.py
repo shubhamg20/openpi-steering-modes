@@ -28,7 +28,7 @@ import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
-
+import openpi.policies.bridge_policy as bridge_policy
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
@@ -465,6 +465,69 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotBridgeDataConfig(DataConfigFactory):
+    """Data config for the Bridge dataset."""
+
+    # If true, will convert joint dimensions to deltas with respect to the current state before passing to the model.
+    # Gripper dimensions will remain in absolute values.
+    model_type: ModelType = ModelType.PI0
+    how_many_cameras: int = 1
+    sample_cameras: bool = False
+    default_prompt: str = ""
+    obs_type: str = "regular"
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                bridge_policy.BridgeInputs(
+                    action_dim=model_config.action_dim,
+                    use_delta_actions=False,
+                    model_type=self.model_type,
+                    how_many_cameras=self.how_many_cameras,
+                    sample_cameras=self.sample_cameras,
+                )
+            ],
+            outputs=[bridge_policy.BridgeOutputs(action_dim=model_config.action_dim, use_delta_actions=False)],
+        )
+        if self.obs_type == "regular":
+            obs_key = "observation.images.image_0"
+        elif self.obs_type == "path":
+            obs_key = "observation.path.image_0"
+        elif self.obs_type == "path_masked":
+            obs_key = "observation.masked_path.image_0"
+        else:
+            raise ValueError(f"Invalid obs_type: {self.obs_type}")
+        repack_dict = {
+            "state": "observation.state",
+            "observation.images.image_0": obs_key,
+            #"observation.images.image_1": "observation.images.image_1",
+            #"observation.images.image_2": "observation.images.image_2",
+            #"observation.images.image_3": "observation.images.image_3",
+            "camera_present": "camera_present",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        repack_transforms = _transforms.Group(inputs=[_transforms.RepackTransform(repack_dict)])
+
+        # Standard model transforms (resizing, tokenization)
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            prompt_from_task=True,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class ActDroidDataConfig(DataConfigFactory):
@@ -957,7 +1020,7 @@ _CONFIGS = [
         name="pi0_droid_lora_finetune",
         model=pi0_config.Pi0Config(
             action_dim=32,
-            action_horizon=16,
+            action_horizon=10,
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora"
         ),
@@ -984,6 +1047,34 @@ _CONFIGS = [
         batch_size=32,
     ),
     TrainConfig(
+        name="pi0_lora_bridge_1_cam",
+        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        data=LeRobotBridgeDataConfig(
+            repo_id="jesbu1/bridge_v2_lerobot",
+            how_many_cameras=1,
+            sample_cameras=False,
+            model_type=ModelType.PI0,
+            base_config=DataConfig(),
+            obs_type="regular",
+            assets=AssetsConfig(
+                # Important: reuse the original DROID norm stats during fine-tuning!
+                assets_dir="/gpfs/projects/weirdlab/shubham/openpi-steering-modes/assets/pi0_lora_bridge_1_cam/jesbu1/",
+                asset_id="bridge_v2_lerobot",
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("s3://openpi-assets/checkpoints/pi0_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=50_000,
+        batch_size=256,
+        fsdp_devices=1,
+        log_interval=50,
+        save_interval=1000,
+        keep_period=10000,
+    ),
+    TrainConfig(
         # This config is for fine-tuning pi0 DROID on a custom (smaller) DROID dataset with LoRA.
         # Low-memory finetuning approach using LoRA adapters.
         name="pi0_droid_lora_finetune_data",
@@ -999,7 +1090,7 @@ _CONFIGS = [
         ),
         model=pi0_config.Pi0Config(
             action_dim=32,
-            action_horizon=16),
+            action_horizon=10),
     ),
     TrainConfig(
         # This config is for fine-tuning pi05-DROID on a custom (smaller) DROID dataset.

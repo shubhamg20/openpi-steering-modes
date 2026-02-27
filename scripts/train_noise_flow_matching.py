@@ -326,7 +326,7 @@ def main() -> None:
     model = MultiCamTransformerFlowMatchingPolicy(
         num_kp_timesteps=110,
         kp_dim=9,
-        extra_dim=8,
+        extra_dim=0,
         action_dim=action_dim,
         action_horizon=dct_k,
         camera_names=["exterior_image_1_left", "wrist_image_left"],
@@ -405,7 +405,7 @@ def main() -> None:
         x0 = _apply_norm(x0, mean=noise_mean, std=noise_std)
 
         b = x0.shape[0]
-        obs = {"images": images, "state": state, "task_name": batch["task_name"]}
+        obs = {"images": images, "state": None, "task_name": batch["task_name"]}
 
         if args.l1_sample_flow:
             # L1 sample prediction: predict clean x1 from noisy interpolation x_t.
@@ -490,7 +490,7 @@ def main() -> None:
                     v_state = _apply_norm(v_state, mean=state_mean, std=state_std)
                     vx0 = _apply_norm(vx0, mean=noise_mean, std=noise_std)
                     bval = vx0.shape[0]
-                    v_obs = {"images": v_images, "state": v_state}
+                    v_obs = {"images": v_images, "state": v_state, "task_name": vbatch["task_name"]}
                     if args.l1_sample_flow:
                         vx1 = vx0  # clean target
                         if args.deterministic_test:
