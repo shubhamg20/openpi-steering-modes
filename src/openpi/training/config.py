@@ -1022,7 +1022,8 @@ _CONFIGS = [
             action_dim=32,
             action_horizon=10,
             paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora"
+            action_expert_variant="gemma_300m_lora",
+            timestep_type="discrete"
         ),
         data=ActDroidDataConfig(
             # Replace with your custom DROID LeRobot dataset repo id.
@@ -1082,7 +1083,12 @@ _CONFIGS = [
             repo_id="shubhamg20/custom_three_tasks",
             assets=AssetsConfig(
                 assets_dir="assets_sft",
-                asset_id="90_three_tasks",
+                # asset_id="178_three_tasks_pi0_droid",
+                # asset_id="178_three_tasks_pi0_droid_with_prompts",
+                # asset_id="178_three_tasks_pi0_droid_no_lang",  #40000 chkpt
+                # asset_id="178_three_tasks_pi0_droid_no_lang_discrete_timestep_40000",
+                asset_id="178_three_tasks_pi0_droid_no_lang_discrete_timestep_99999",
+                # asset_id="178_three_tasks_pi0_droid_with_prompts_discrete_timestep_40000",
             ),
             use_delta_actions=False,
             base_image="exterior_image_1_left",

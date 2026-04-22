@@ -58,11 +58,13 @@ class NoiseDataset(Dataset):
         state_idxs: List[int],
         cam_keys: List[str],
         dct_basis: torch.Tensor | None = None,
+        siglip_cache: Dict[int, torch.Tensor] | None = None,
     ):
         self.base = base
         self.state_idxs = state_idxs
         self.cam_keys = cam_keys
         self.dct_basis = dct_basis
+        self.siglip_cache = siglip_cache  # {episode_id: (T, n_cams, 2048)} on CPU
 
     def __len__(self) -> int:
         return len(self.base)
@@ -72,14 +74,24 @@ class NoiseDataset(Dataset):
 
         canonical = ["exterior_image_1_left", "wrist_image_left"]
         images: Dict[str, torch.Tensor] = {}
-        for i in range(2):
-            if i < len(self.cam_keys):
-                k = self.cam_keys[i]
-                img = item[f"observation.images.{k}"]
-            else:
-                img = torch.zeros(3, 224, 224, dtype=torch.float32)
-            images[canonical[i]] = img
+
+        if self.siglip_cache is not None:
+            episode_id = item["episode_index"].item() if isinstance(item["episode_index"], torch.Tensor) else item["episode_index"]
+            t = item["frame_index"].item() if isinstance(item["frame_index"], torch.Tensor) else item["frame_index"]
+            pooled = self.siglip_cache[episode_id]  # (T, n_cams, 2048)
+            for i, k in enumerate(canonical):
+                images[k] = pooled[t, i]  # (2048,) pre-pooled feature
+        else:
+            for i in range(2):
+                if i < len(self.cam_keys):
+                    k = self.cam_keys[i]
+                    img = item[f"observation.images.{k}"]
+                else:
+                    img = torch.zeros(3, 224, 224, dtype=torch.float32)
+                images[canonical[i]] = img
+
         state = torch.cat([item["observation.joint_position"], item["observation.gripper_position"], item["observation.human_traj"]], dim=-1)
+        state = state[self.state_idxs]
         assert state.shape[0] == len(self.state_idxs)
         if "noise_action" not in item:
             raise KeyError("Expected 'noise_action' in episode pickle.")
@@ -87,6 +99,92 @@ class NoiseDataset(Dataset):
         if self.dct_basis is not None:
             target = torch.matmul(self.dct_basis.transpose(0, 1), target)
         return {"images": images, "state": state, "target": target, "task_name": item["task_name"]}
+
+def _precompute_siglip_features(
+    episode_paths: List[str],
+    cam_data_keys: List[str],
+    encoder,
+    device: torch.device,
+    batch_size: int = 64,
+    num_workers: int = 4,
+) -> Dict[int, torch.Tensor]:
+    """Precompute mean-pooled SigLIP features for all episodes into CPU memory.
+
+    Uses a single flat DataLoader over all (episode, timestep) pairs for efficiency.
+
+    Returns:
+        cache: {episode_id: tensor(T, n_cams, 2048)} on CPU
+    """
+    import pickle
+    import numpy as np
+    from torch.utils.data import DataLoader as _DL, Dataset as _DS
+
+    n_cams = len(cam_data_keys)
+
+    class _FlatImgDS(_DS):
+        """Flat dataset: one item per (episode, timestep), returns (episode_id, t, n_cams, 3, H, W)."""
+        def __init__(self, ep_paths, keys):
+            self.keys = keys
+            self.index = []  # list of (episode_id, t, ep_path)
+            for ep_id, ep_path in enumerate(ep_paths):
+                with open(ep_path, "rb") as f:
+                    data = pickle.load(f)
+                if "robot" in data and "timesteps" in data["robot"]:
+                    ts = data["robot"]["timesteps"]
+                elif "timesteps" in data:
+                    ts = data["timesteps"]
+                else:
+                    raise ValueError(f"No timesteps in {ep_path}")
+                for t in range(len(ts)):
+                    self.index.append((ep_id, t, ts[t]))
+
+        def __len__(self):
+            return len(self.index)
+
+        def __getitem__(self, i):
+            ep_id, t, timestep = self.index[i]
+            imgs = []
+            for k in self.keys:
+                img = np.array(timestep["observations"]["image"][k])
+                if img.shape[-1] == 4:
+                    img = img[:, :, :3]
+                imgs.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+            return ep_id, t, torch.stack(imgs, dim=0)  # (n_cams, 3, H, W)
+
+    encoder.eval()
+    n_total = sum(1 for _ in open(episode_paths[0], "rb") or [])  # just for print
+    print(f"[precompute] Building flat dataset over {len(episode_paths)} episodes ...")
+    flat_ds = _FlatImgDS(episode_paths, cam_data_keys)
+    print(f"[precompute] {len(flat_ds)} total timesteps — running SigLIP in one pass ...")
+    loader = _DL(flat_ds, batch_size=batch_size, shuffle=False,
+                 num_workers=num_workers, pin_memory=True)
+
+    # Accumulate per-episode lists
+    ep_feats: Dict[int, List[torch.Tensor]] = {}
+    ep_ts: Dict[int, List[int]] = {}
+
+    with torch.no_grad():
+        for ep_ids, ts, imgs in tqdm.tqdm(loader, desc="siglip", dynamic_ncols=True):
+            imgs = imgs.to(device)  # (B, n_cams, 3, H, W)
+            cam_feats = []
+            for c in range(n_cams):
+                tokens = encoder(imgs[:, c])   # (B, N_tokens, 2048)
+                cam_feats.append(tokens.mean(1).cpu())  # (B, 2048)
+            pooled = torch.stack(cam_feats, dim=1)  # (B, n_cams, 2048)
+            for b in range(pooled.shape[0]):
+                eid = int(ep_ids[b])
+                t = int(ts[b])
+                ep_feats.setdefault(eid, []).append((t, pooled[b]))
+
+    # Sort by timestep and pack into tensors
+    cache: Dict[int, torch.Tensor] = {}
+    for eid, items in ep_feats.items():
+        items.sort(key=lambda x: x[0])
+        cache[eid] = torch.stack([v for _, v in items], dim=0)  # (T, n_cams, 2048)
+
+    print(f"[precompute] Done. {len(cache)} episodes cached.")
+    return cache
+
 
 def _infinite(loader: DataLoader) -> Iterator[Dict[str, Any]]:
     while True:
@@ -117,7 +215,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--save-every", type=int, default=2000)
-    p.add_argument("--out-dir", default="runs/noise_transformer_flow_matching")
+    p.add_argument("--out-dir", default="/gpfs/scrubbed/shubham/chkpts-sft/noise_transformer_flow_matching")
     p.add_argument("--run-prefix", default=None)
     p.add_argument("--train-backbone", action="store_true")
     p.add_argument("--resnet-size", type=int, default=34)
@@ -142,6 +240,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-demos", type=int, default=0, help="Limit number of episodes used for training.")
     p.add_argument("--num-steps-euler", type=int, default=50, help="Euler steps used for sampling (saved in ckpt).")
     p.add_argument("--dct-k", type=int, default=0, help="If >0, train on DCT coeffs (KxA) instead of HxA.")
+    p.add_argument("--img-encoder", type=str, default="Pi0SigLIP", help="Image encoder: 'Dinov2WithNorm' or 'Pi0SigLIP'.")
+    p.add_argument("--pi0-checkpoint", type=str, default='/gpfs/scrubbed/shubham/chkpts/pi0_droid_no_lang/pytorch_160000/model.safetensors', help="Path to pi0 checkpoint (.pt) when --img-encoder=Pi0SigLIP.")
     return p.parse_args()
 
 
@@ -185,7 +285,7 @@ def main() -> None:
     # state_joint_names = meta["state_joint_names"]
     # action_joint_names = meta["action_joint_names"]
     # state_idxs = list(vega_policy.make_action_idxs_in_state(state_joint_names, action_joint_names))
-    state_idxs = list(range(8+110*9))
+    state_idxs = list(range(8))
     state_dim = len(state_idxs)
 
     data_action_horizon = int(cfg.model.action_horizon)
@@ -210,9 +310,11 @@ def main() -> None:
     episode_lengths = base.episode_lengths
     cam_keys: List[str] = base.image_keys
 
+    # siglip_cache built later (after device + model are ready); placeholder here
     full_dataset: Dataset = NoiseDataset(
         base, state_idxs=state_idxs, cam_keys=cam_keys, dct_basis=dct_basis_cpu
     )
+    _siglip_cache_ref: List[Dict[int, torch.Tensor]] = [None]  # filled after model is on device
     if args.overfit_num and int(args.overfit_num) > 0:
         n = min(int(args.overfit_num), len(full_dataset))
         full_dataset = Subset(full_dataset, list(range(n)))
@@ -330,23 +432,53 @@ def main() -> None:
         action_dim=action_dim,
         action_horizon=dct_k,
         camera_names=["exterior_image_1_left", "wrist_image_left"],
-        image_feature_dim=256,
-        fused_image_dim=256,
+        image_feature_dim=256,   #does not matter for Pi0SigLIP
+        fused_image_dim=256,     #does not matter for Pi0SigLIP
         d_model=256,
         nhead=8,
         num_encoder_layers=4,
-        img_encoder="Dinov2WithNorm",
+        img_encoder=args.img_encoder,
+        pi0_checkpoint_path=args.pi0_checkpoint,
         conditioning="onehot",
+        state_dim=state_dim,
     ).to(device)
+
+    # Precompute SigLIP features — all ranks work in parallel, then share results.
+    my_episodes = base.episode_paths[rank::world_size] if distributed else base.episode_paths
+    my_episode_ids = list(range(rank, len(base.episode_paths), world_size)) if distributed else list(range(len(base.episode_paths)))
+    partial_cache = _precompute_siglip_features(
+        episode_paths=my_episodes,
+        cam_data_keys=base.data_keys,
+        encoder=model.dino_encoder,
+        device=device,
+        batch_size=256,
+        num_workers=num_workers,
+    )
+    # Re-key partial cache to global episode ids
+    partial_cache_global = {my_episode_ids[k]: v for k, v in partial_cache.items()}
+    if distributed:
+        all_partial: List[Dict[int, torch.Tensor]] = [None] * world_size
+        dist.all_gather_object(all_partial, partial_cache_global)
+        siglip_cache: Dict[int, torch.Tensor] = {}
+        for d in all_partial:
+            siglip_cache.update(d)
+    else:
+        siglip_cache = partial_cache_global
+    # Inject cache into the dataset (works through Subset wrappers too)
+    _ds = full_dataset
+    while hasattr(_ds, "dataset"):
+        _ds = _ds.dataset
+    _ds.siglip_cache = siglip_cache
 
     if distributed:
         model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    num_steps = int(args.num_steps or cfg.num_train_steps)
     if isinstance(model, MultiCamTransformerFlowMatchingPolicy):
         from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
         warmup = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=1000)
-        cosine = CosineAnnealingLR(opt, T_max=total_steps - 1000, eta_min=1e-6)
+        cosine = CosineAnnealingLR(opt, T_max=num_steps - 1000, eta_min=1e-6)
         scheduler = SequentialLR(opt, schedulers=[warmup, cosine], milestones=[1000])
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -405,7 +537,7 @@ def main() -> None:
         x0 = _apply_norm(x0, mean=noise_mean, std=noise_std)
 
         b = x0.shape[0]
-        obs = {"images": images, "state": None, "task_name": batch["task_name"]}
+        obs = {"images": images, "state": state, "task_name": batch["task_name"]}
 
         if args.l1_sample_flow:
             # L1 sample prediction: predict clean x1 from noisy interpolation x_t.
@@ -415,7 +547,7 @@ def main() -> None:
                 t = torch.full((b,), 0.5, device=device, dtype=torch.float32)
             else:
                 x0_noise = torch.randn_like(x1)
-                t = torch.rand(b, device=device, dtype=torch.float32)  # (B,)
+                t = torch.rand(b, device=device, dtype=torch.float32) 
             t_view = t.view(b, 1, 1)
             x_t = (1.0 - t_view) * x0_noise + t_view * x1
             x1_hat = model(obs, x_t, t)  # (B,T,A)
@@ -424,7 +556,7 @@ def main() -> None:
         else:
             # Original velocity flow matching.
             x1 = torch.randn_like(x0)
-            t = torch.rand(b, device=device, dtype=torch.float32)  # (B,)
+            t = torch.distributions.Beta(1.5, 1).sample((b,)).to(device=device, dtype=torch.float32) * 0.999 + 0.001  # (B,) Beta(1.5,1) like pi0
             t_view = t.view(b, 1, 1)
             x_t = (1.0 - t_view) * x0 + t_view * x1
             v_target = x1 - x0

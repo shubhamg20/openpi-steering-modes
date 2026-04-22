@@ -14,18 +14,32 @@ def _load_episode_data(episode_data_path: str) -> dict:
 
 
 class ActDataset(torch.utils.data.Dataset):
+    # Default prompts for each task subdirectory
+    # DEFAULT_TASK_PROMPTS: dict[str, str] = {
+    #     "paired_pan": "pick up the lid and place it on the pan",
+    #     "paired_purple": "pick up the purple object and place it in the pan",
+    #     "paired_yellow": "pick up the yellow object and place it in the pan",
+    # }
+    DEFAULT_TASK_PROMPTS: dict[str, str] = {
+        "paired_pan": "",
+        "paired_purple": "",
+        "paired_yellow": "",
+    }
+
     def __init__(
         self,
         root_dir: str,
         action_horizon: int,
-        prompt: str = "",  # either fixed string or we'll use task folder name
-        with_noise: bool = False,  
+        prompt: str = "",  # fallback prompt if task not in task_prompts
+        task_prompts: dict[str, str] | None = None,  # per-task prompts keyed by subdir name
+        with_noise: bool = False,
         extra_episode_keys: list[str] = [],  # extra keys to load from episode pickle (e.g. "noise_action" for noise dataset
     ):
         self.extra_episode_keys = extra_episode_keys
         self.root_dir = root_dir
         self.action_horizon = action_horizon
         self.prompt = prompt
+        self._task_prompts = self.DEFAULT_TASK_PROMPTS
 
         # scan task folders for episode pkls
         self.episode_paths = []
@@ -39,19 +53,30 @@ class ActDataset(torch.utils.data.Dataset):
                 continue    
             task_name = task_dir.name
             if with_noise:
-                files = sorted(task_dir.glob("*_noise.pkl"))[:]
+                # files = sorted(task_dir.glob("*_pi0-droid_noise.pkl"))[:]
+                # files = sorted(task_dir.glob("*_pi0-droid_with_prompts_noise.pkl"))[:]
+                # files = sorted(task_dir.glob("*_pi0-droid-no-lang_noise.pkl"))[:]
+                # files = sorted(task_dir.glob("*_pi0-droid-no-lang-discrete-timestep_noise_40000.pkl"))[:]
+                files = sorted(task_dir.glob("*_pi0-droid-no-lang-discrete-timestep_noise_99999.pkl"))[:]
+                # files = sorted(task_dir.glob("*_pi0-droid-with-prompts-discrete-timestep_noise_40000.pkl"))[:]
             else:
                files = sorted(
                     f for f in task_dir.glob("*.pkl")
-                    if not f.name.endswith("_noise.pkl")
+                    if "_noise" not in f.name
                 )
             for episode_pkl in files:
                 data = _load_episode_data(str(episode_pkl))
-                episode_len = len(data["robot"]["timesteps"])
+                if "robot" in data and "timesteps" in data["robot"]:
+                    episode_len = len(data["robot"]["timesteps"])
+                elif "timesteps" in data:
+                    episode_len = len(data["timesteps"])
+                else:
+                    raise ValueError(f"Could not determine episode length for {episode_pkl}")
                 self.episode_paths.append(str(episode_pkl))
                 self.episode_lengths.append(episode_len)
-                self.episode_prompts.append(prompt)
+                self.episode_prompts.append(self._task_prompts.get(task_name, prompt))
                 self.episode_task_names.append(task_name)
+
 
         # flat index: (episode_id, t)
         self.idx_to_episode_and_step = []
@@ -60,14 +85,18 @@ class ActDataset(torch.utils.data.Dataset):
                 self.idx_to_episode_and_step.append((episode_id, t))
 
         sample_data = _load_episode_data(self.episode_paths[0])
-        self.image_keys = list(sample_data["robot"]["timesteps"][0]["observations"]["image"].keys())
+        if "robot" in sample_data and "timesteps" in sample_data["robot"] and len(sample_data["robot"]["timesteps"]) > 0:
+            self.image_keys = list(sample_data["robot"]["timesteps"][0]["observations"]["image"].keys())
+        elif "timesteps" in sample_data and len(sample_data["timesteps"]) > 0:
+            self.image_keys = list(sample_data["timesteps"][0]["observations"]["image"].keys())
+        else:
+             raise ValueError(f"Could not find timesteps in sample episode data at {self.episode_paths[0]} to determine image keys")
 
         #TODO Find better way
         ###################################################################################
         self.image_keys = ["exterior_image_1_left", "wrist_image_left"]
         self.data_keys = ["23804457_left", "13263313_left"] 
         ##################################################################################
-
         print(f"[Act Dataset] found image keys: {self.data_keys}")
 
         print(f"[Act Dataset] found {len(self.episode_paths)} episodes, "
@@ -84,19 +113,29 @@ class ActDataset(torch.utils.data.Dataset):
         task_name = self.episode_task_names[episode_id]
 
         data = _load_episode_data(episode_path)
-        timesteps = data["robot"]["timesteps"]
-        human_timesteps = data["human"]["timesteps"]
+        if "robot" in data and "timesteps" in data["robot"]:
+            timesteps = data["robot"]["timesteps"]
+        elif "timesteps" in data:
+            timesteps = data["timesteps"]
+        else:
+            raise ValueError(f"Could not find timesteps in episode data at {episode_path}")
+        if "human" in data and "timesteps" in data["human"]:
+            human_timesteps = data["human"]["timesteps"]
+        else:
+            human_timesteps = []
 
         # --- state ---
         joint_pos = torch.from_numpy(np.array(timesteps[t]["observations"]["robot_state"]["joint_positions"])).float()
         gripper_pos = torch.from_numpy(np.array([timesteps[t]["observations"]["robot_state"]["gripper_position"]])).float()
-        human_traj = torch.from_numpy(np.stack([np.array(ts["hand_pose"]) for ts in human_timesteps], axis=0)).float()
-        # Pad to 110 timesteps with the last timestep's full pose
-        if human_traj.shape[0] < 110:
-            last_pose = torch.from_numpy(np.array(human_timesteps[-1]["hand_pose"])).float()
-            pad_count = 110 - human_traj.shape[0]
-            pad_vals = last_pose.repeat(pad_count, 1)
-            human_traj = torch.cat([human_traj, pad_vals], dim=0)
+        if not human_timesteps:
+            human_traj = torch.full((110, 4), -1.0)
+        else:
+            human_traj = torch.from_numpy(np.stack([np.array(ts["hand_pose"]) for ts in human_timesteps], axis=0)).float()
+            # Pad to 110 timesteps with the last timestep's full pose
+            if human_traj.shape[0] < 110:
+                last_pose = human_traj[-1]
+                pad_count = 110 - human_traj.shape[0]
+                human_traj = torch.cat([human_traj, last_pose.unsqueeze(0).expand(pad_count, -1)], dim=0)
 
         # --- action chunk [t, t+action_horizon) ---
         action_idxs = list(range(t, t + self.action_horizon))
@@ -110,7 +149,7 @@ class ActDataset(torch.utils.data.Dataset):
                 np.array([timesteps[i]["action"]["target_gripper_position"]])
             ]) for i in action_idxs
         ], axis=0)).float()  # (action_horizon, action_dim)
-
+        # print(self.episode_prompts[episode_id])
         result = {
             "observation.joint_position": joint_pos,
             "observation.gripper_position": gripper_pos, 

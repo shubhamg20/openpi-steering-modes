@@ -70,9 +70,11 @@ class PaliGemmaWithExpertModel(nn.Module):
             raise ValueError(f"Invalid precision: {precision}")
 
         params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
+            # Keep the full image processing pipeline (vision_tower + multi_modal_projector)
+            # in float32.  get_image_features() calls both, so both must share the same dtype
+            # to avoid "mat1 and mat2 must have the same dtype" errors at the projector linear.
+            "vision_tower",
+            "multi_modal_projector",
             "input_layernorm",
             "post_attention_layernorm",
             "model.norm",
@@ -83,7 +85,12 @@ class PaliGemmaWithExpertModel(nn.Module):
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        # Vision pipeline (vision_tower + multi_modal_projector) runs in float32.
+        # Cast output to match the language model's dtype (bfloat16 in bfloat16 mode)
+        # so that image embeddings and language embeddings can be concatenated.
+        img_features = self.paligemma.model.get_image_features(image.float())
+        lang_dtype = self.paligemma.language_model.embed_tokens.weight.dtype
+        return img_features.to(dtype=lang_dtype)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)

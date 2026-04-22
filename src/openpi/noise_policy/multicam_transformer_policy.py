@@ -26,30 +26,61 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from openpi.noise_policy.adaln_attention import AdaLNAttentionBlock, AdaLNFinalLayer
+from openpi.noise_policy.adaln_attention import AdaLNAttentionBlock, AdaLNFinalLayer, AdaLNHybridAttentionBlock
 from openpi.noise_policy.utils import SinusoidalPosEmb, init_weights
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-class SinusoidalPositionEmbedding(nn.Module):
-    """Sinusoidal position embedding for scalar time values in [0, 1]."""
+# class SinusoidalPositionEmbedding(nn.Module):
+#     """Sinusoidal position embedding for scalar time values in [0, 1].
+#     Uses vanilla transformer 1/10000 frequency schedule — designed for integer
+#     token positions, not t in [0,1]. High-frequency components barely vary over
+#     the diffusion timestep range."""
+#
+#     def __init__(self, dim: int):
+#         super().__init__()
+#         self.dim = dim
+#
+#     def forward(self, t: torch.Tensor) -> torch.Tensor:
+#         # t: (B,)
+#         device = t.device
+#         half_dim = self.dim // 2
+#         emb_scale = math.log(10000) / (half_dim - 1)
+#         freqs = torch.exp(
+#             torch.arange(half_dim, device=device, dtype=torch.float32) * -emb_scale
+#         )
+#         emb = t[:, None].float() * freqs[None, :]  # (B, half_dim)
+#         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)  # (B, dim)
+#         return emb
 
-    def __init__(self, dim: int):
+
+class SinusoidalPositionEmbedding(nn.Module):
+    """Pi0-style sinusoidal time embedding tuned for t in [0, 1].
+
+    Periods are log-spaced between min_period and max_period (matching pi0's
+    posemb_sincos), so every frequency band has meaningful variation across the
+    diffusion timestep range instead of the vanilla 1/10000 NLP schedule.
+    """
+
+    def __init__(self, dim: int, min_period: float = 4e-3, max_period: float = 4.0):
         super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"dim ({dim}) must be even")
         self.dim = dim
+        self.min_period = min_period
+        self.max_period = max_period
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         # t: (B,)
         device = t.device
         half_dim = self.dim // 2
-        emb_scale = math.log(10000) / (half_dim - 1)
-        freqs = torch.exp(
-            torch.arange(half_dim, device=device, dtype=torch.float32) * -emb_scale
-        )
-        emb = t[:, None].float() * freqs[None, :]  # (B, half_dim)
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)  # (B, dim)
+        fraction = torch.linspace(0.0, 1.0, half_dim, device=device, dtype=torch.float32)
+        period = self.min_period * (self.max_period / self.min_period) ** fraction  # log-spaced
+        freqs = 2.0 * math.pi / period                                              # (half_dim,)
+        emb = t[:, None].float() * freqs[None, :]                                  # (B, half_dim)
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)                  # (B, dim)
         return emb
 
 
@@ -162,7 +193,8 @@ class Dinov2WithNorm(nn.Module):
         Returns:
             patch_tokens: (B, N_patches, hidden_size)
         """
-        out = self.encoder(x, output_hidden_states=True)
+        with torch.no_grad():
+            out = self.encoder(x, output_hidden_states=True)
         return out.last_hidden_state[:, _UNUSED_TOKENS:]  # strip CLS + registers
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -221,6 +253,130 @@ def load_dinov2(
 
 
 # ---------------------------------------------------------------------------
+# Pi0 SigLIP encoder
+# ---------------------------------------------------------------------------
+
+# SigLIP normalisation (mean=0.5, std=0.5 for all channels)
+_SIGLIP_MEAN = torch.tensor([0.5, 0.5, 0.5])
+_SIGLIP_STD  = torch.tensor([0.5, 0.5, 0.5])
+
+
+class Pi0SigLIPEncoder(nn.Module):
+    """Frozen SigLIP vision encoder extracted from a pi0 pretrained checkpoint.
+
+    Loads ONLY the vision_tower + multi_modal_projector weights — skips
+    instantiating the full Pi0 / Gemma language model entirely, which saves
+    ~3 GB of GPU memory and several seconds of load time.
+
+    Input contract:
+        x : (B, C, H, W) float32 in [0, 1]  –or–  (B, H, W, C) / uint8.
+        Internal SigLIP normalisation (mean=0.5, std=0.5) is applied automatically.
+
+    Output:
+        image_tokens : (B, N_tokens, projection_dim)   where projection_dim=2048
+    """
+
+    # Keys in the safetensors file that belong to the vision pipeline.
+    # Everything else (Gemma LM, action expert, etc.) is skipped.
+    # Compiled checkpoints store weights under _orig_mod.paligemma.model.*
+    _VISION_PREFIXES = (
+        "paligemma_with_expert.paligemma.model.vision_tower.",
+        "paligemma_with_expert.paligemma.model.multi_modal_projector.",
+        "paligemma_with_expert._orig_mod.paligemma.model.vision_tower.",
+        "paligemma_with_expert._orig_mod.paligemma.model.multi_modal_projector.",
+    )
+
+    def __init__(self, checkpoint_path: str):
+        super().__init__()
+        from safetensors import safe_open
+        from transformers import PaliGemmaForConditionalGeneration
+        from transformers.models.auto import CONFIG_MAPPING
+
+        # Build a minimal PaliGemma config (vision + projector only; no need
+        # to match the LM head exactly since we never run language generation).
+        vlm_cfg = CONFIG_MAPPING["paligemma"]()
+        vlm_cfg._vocab_size = 257152  # noqa: SLF001
+        vlm_cfg.image_token_index = 257152
+        vlm_cfg.vision_config.intermediate_size = 4304
+        vlm_cfg.vision_config.projection_dim = 2048
+        vlm_cfg.vision_config.projector_hidden_act = "gelu_fast"
+        vlm_cfg.vision_config.torch_dtype = "float32"
+        # LM text config — values match the Pi0 paligemma_variant="gemma2_2b" defaults.
+        vlm_cfg.text_config.hidden_size = 2048
+        vlm_cfg.text_config.intermediate_size = 16384
+        vlm_cfg.text_config.num_attention_heads = 8
+        vlm_cfg.text_config.head_dim = 256
+        vlm_cfg.text_config.num_hidden_layers = 18
+        vlm_cfg.text_config.num_key_value_heads = 1
+        vlm_cfg.text_config.hidden_activation = "gelu_pytorch_tanh"
+        vlm_cfg.text_config.vocab_size = 257152
+
+        # Instantiate PaliGemma and immediately evict the language model from
+        # the inner PaliGemmaModel before any weights are loaded.
+        # PaliGemmaForConditionalGeneration.language_model is a read-only property
+        # on the outer class, but self.model.language_model is a plain nn.Module
+        # submodule — popping it from _modules prevents GPU allocation.
+        # get_image_features() only uses model.vision_tower + model.multi_modal_projector,
+        # so this is safe.
+        paligemma = PaliGemmaForConditionalGeneration(config=vlm_cfg)
+        paligemma.model._modules.pop("language_model", None)
+        paligemma._modules.pop("lm_head", None)
+
+        # Load only the vision weights from the safetensors checkpoint.
+        # Checkpoint keys look like:
+        #   "paligemma_with_expert._orig_mod.paligemma.model.vision_tower.X"
+        # PaliGemmaForConditionalGeneration expects:
+        #   "model.vision_tower.X"
+        # So we strip everything up to and including "paligemma.model." prefix.
+        _STRIP_TO = "paligemma.model."
+        vision_sd = {}
+        with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                for prefix in self._VISION_PREFIXES:
+                    if key.startswith(prefix):
+                        idx = key.index(_STRIP_TO) + len(_STRIP_TO)
+                        local_key = "model." + key[idx:]
+                        vision_sd[local_key] = f.get_tensor(key)
+                        break
+
+        missing, unexpected = paligemma.load_state_dict(vision_sd, strict=False)
+        vision_missing = [k for k in missing if "vision_tower" in k or "multi_modal_projector" in k]
+        if vision_missing:
+            raise RuntimeError(f"Failed to load vision weights: {vision_missing}")
+
+        self._paligemma = paligemma
+        self.requires_grad_(False)
+        self.hidden_size: int = vlm_cfg.vision_config.projection_dim  # 2048
+
+        self.register_buffer("_mean", _SIGLIP_MEAN.view(1, 3, 1, 1))
+        self.register_buffer("_std",  _SIGLIP_STD.view(1, 3, 1, 1))
+
+    def _to_bchw_float(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        if x.size(-1) in (1, 3):
+            x = x.permute(0, 3, 1, 2)
+        x = x.float()
+        if x.max() > 1.0:
+            x = x / 255.0
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns (B, N_tokens, hidden_size)."""
+        x = self._to_bchw_float(x)
+        if x.shape[-2] != 224 or x.shape[-1] != 224:
+            x = torch.nn.functional.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        x = (x - self._mean) / self._std
+        with torch.no_grad():
+            return self._paligemma.model.get_image_features(x.float())  # (B, N_tokens, 2048)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._paligemma.eval()   # always frozen
+        return self
+
+
+# ---------------------------------------------------------------------------
 # Multi-camera fuser
 # ---------------------------------------------------------------------------
 
@@ -240,7 +396,7 @@ class MultiCameraEncoder(nn.Module):
     def __init__(
         self,
         camera_names: Sequence[str],
-        dino_encoder: Dinov2WithNorm,
+        dino_encoder: "Dinov2WithNorm | Pi0SigLIPEncoder",
         image_feature_dim: int = 256,
         fused_dim: int = 256,
     ):
@@ -276,12 +432,16 @@ class MultiCameraEncoder(nn.Module):
 
         feats = []
         for c in cams:
-            patch_tokens = self.dino(c)           # (B, N_patches, hidden_size)
-            pooled       = patch_tokens.mean(1)   # (B, hidden_size)  — mean pool
-            feats.append(self.cam_proj(pooled))   # (B, image_feature_dim)
+            if c.ndim == 2:
+                # Pre-pooled feature: (B, hidden_size) — skip frozen encoder entirely
+                pooled = c.float()
+            else:
+                patch_tokens = self.dino(c).float()  # (B, N_patches, hidden_size)
+                pooled = patch_tokens.mean(1)         # (B, hidden_size)
+            feats.append(self.cam_proj(pooled))       # (B, image_feature_dim)
 
-        fused = torch.cat(feats, dim=-1)          # (B, image_feature_dim * n_cams)
-        return self.fuse(fused)                   # (B, fused_dim)
+        fused = torch.cat(feats, dim=-1)              # (B, image_feature_dim * n_cams)
+        return self.fuse(fused)                       # (B, fused_dim)
 
 class KeypointTrajectoryEncoder(nn.Module):
     """
@@ -357,18 +517,20 @@ class ObservationEncoder(nn.Module):
         num_kp_timesteps,
         kp_dim,
         extra_dim,
-        dino_encoder: Dinov2WithNorm,
+        dino_encoder: "Dinov2WithNorm | Pi0SigLIPEncoder",
         image_feature_dim: int = 256,
         fused_image_dim: int = 256,
         kp_channels=(64,128,256), kp_kernel_size=3, extra_out_dim=32,
         conditioning: str = "keypoints",  # "keypoints" or "onehot"
         task_names: Optional[Sequence[str]] = None,
+        state_dim: int = 0,  # raw state dim concatenated after fused image features
     ):
         super().__init__()
         if conditioning == "keypoints":
             self.state_dim = num_kp_timesteps * kp_dim + extra_dim
         self.conditioning = conditioning
         self.task_names = list(task_names) if task_names is not None else None
+        self.raw_state_dim = state_dim
 
         self.camera_encoder = MultiCameraEncoder(
             camera_names=camera_names,
@@ -381,33 +543,39 @@ class ObservationEncoder(nn.Module):
                 num_kp_timesteps, kp_dim, extra_dim,
                 channels=kp_channels, kernel_size=kp_kernel_size, extra_out_dim=extra_out_dim
             )
-            self.output_dim = fused_image_dim + self.state_encoder.output_dim
+            self.output_dim = fused_image_dim + state_dim + self.state_encoder.output_dim
         elif conditioning == "onehot":
             if self.task_names is None:
                 raise ValueError("task_names must be provided for onehot conditioning")
             self.task_name_to_idx = {name: i for i, name in enumerate(self.task_names)}
             self.onehot_dim = len(self.task_names)
-            self.output_dim = fused_image_dim + self.onehot_dim
+            self.output_dim = fused_image_dim + state_dim + self.onehot_dim
         else:
             raise ValueError(f"Unknown conditioning type: {conditioning}")
 
     def _get_obs(self, observation: Any) -> Tuple[Mapping[str, torch.Tensor], torch.Tensor, Optional[str]]:
         # If onehot, expect observation to have 'task_name' key
+
         if hasattr(observation, "images") and hasattr(observation, "state"):
             images = observation.images
             state = observation.state
             task_name = getattr(observation, "task_name", None)
         elif isinstance(observation, Mapping):
-            if "images" not in observation or "state" not in observation:
-                raise ValueError("Expected dict with keys {'images','state'}")
+            if "images" not in observation:
+                raise ValueError("Expected dict with key 'images'")
             images = observation["images"]
-            state = observation["state"]
+            state = observation.get("state", None)
             task_name = observation.get("task_name", None)
         else:
             raise TypeError(f"Expected Observation-like or dict, got {type(observation)}")
 
         if not isinstance(images, Mapping):
             raise TypeError(f"images must be Mapping, got {type(images)}")
+        if self.conditioning == "keypoints":
+            if state is None:
+                raise ValueError("state must be provided for keypoints conditioning")
+            if not isinstance(state, torch.Tensor):
+                raise TypeError(f"state must be torch.Tensor, got {type(state)}")
         # if not isinstance(state, torch.Tensor):
         #     raise TypeError(f"state must be torch.Tensor, got {type(state)}")
         # if state.ndim == 1:
@@ -424,20 +592,28 @@ class ObservationEncoder(nn.Module):
         fused = self.camera_encoder(images)       # (B, fused_image_dim)
         if self.conditioning == "keypoints":
             s_emb = self.state_encoder(state.float())    # (B, state_proj_dim)
-            return torch.cat([fused, s_emb], dim=-1)  # (B, obs_dim)
+            return torch.cat([fused, state, s_emb], dim=-1)  # (B, obs_dim)
         elif self.conditioning == "onehot":
             # task_name must be provided for each sample in batch
             if task_name is None:
                 raise ValueError("task_name must be provided in observation for onehot conditioning")
+            if state is None:
+                raise ValueError("state must be provided in observation for onehot conditioning")
+            b = fused.shape[0]
             # Support batch or single
             if isinstance(task_name, str):
-                task_name = [task_name] * state.shape[0]
-            onehot = torch.zeros((state.shape[0], self.onehot_dim), device=state.device)
+                task_name = [task_name] * b
+            elif len(task_name) == 1 and b > 1:
+                task_name = list(task_name) * b
+            elif len(task_name) != b:
+                raise ValueError(f"task_name batch size ({len(task_name)}) does not match images batch size ({b})")
+
+            onehot = torch.zeros((b, self.onehot_dim), device=fused.device, dtype=fused.dtype)
             for i, name in enumerate(task_name):
                 if name not in self.task_name_to_idx:
                     raise ValueError(f"Unknown task_name '{name}' for onehot encoding")
                 onehot[i, self.task_name_to_idx[name]] = 1.0
-            return torch.cat([fused, onehot], dim=-1)
+            return torch.cat([fused, state.float(), onehot], dim=-1)
         else:
             raise ValueError(f"Unknown conditioning type: {self.conditioning}")
 
@@ -459,7 +635,7 @@ class TransformerDenoiser(nn.Module):
         time_embedding_dim: int = 128,
         d_model: int = 256,
         nhead: int = 8,
-        num_encoder_layers: int = 6,
+        num_encoder_layers: int = 4,
         mlp_ratio: float = 4.0,
         positional_dropout: float = 0.1,
         output_hidden_dims: List[int] = [256],
@@ -590,14 +766,27 @@ class MultiCamTransformerFlowMatchingPolicy(nn.Module):
         use_layer_norm: bool = True,
         dropout_rate: float = 0.0,
         img_encoder: str = "Dinov2WithNorm",
+        pi0_checkpoint_path: Optional[str] = None,
         conditioning: str = "keypoints",
         task_names: Optional[List[str]] = ["paired_purple", "paired_pan", "paired_yellow"],
+        state_dim: int = 8,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.action_horizon = action_horizon
-        self.dino_encoder = Dinov2WithNorm() if img_encoder == "Dinov2WithNorm" else None
-        self.dino_encoder.eval()
+        self.use_prefix_attention = False
+
+        if img_encoder == "Pi0SigLIP":
+            if pi0_checkpoint_path is None:
+                raise ValueError("pi0_checkpoint_path must be set when img_encoder='Pi0SigLIP'")
+            _img_enc = Pi0SigLIPEncoder(pi0_checkpoint_path)
+            _img_enc.eval()
+            self.dino_encoder = _img_enc
+        else:
+            self.dino_encoder = Dinov2WithNorm()
+            self.dino_encoder.eval()
+
+        self.token_obs_encoder = None
         self.obs_encoder = ObservationEncoder(
             camera_names=camera_names,
             num_kp_timesteps=num_kp_timesteps,
@@ -608,10 +797,12 @@ class MultiCamTransformerFlowMatchingPolicy(nn.Module):
             fused_image_dim=fused_image_dim,
             conditioning=conditioning,
             task_names=task_names if conditioning == "onehot" else None,
+            state_dim=state_dim,
         )
+
         if output_hidden_dims is None:
             output_hidden_dims = [256]
-            
+
         self.denoiser = TransformerDenoiser(
             obs_dim=self.obs_encoder.output_dim,
             action_dim=action_dim,
@@ -636,16 +827,16 @@ class MultiCamTransformerFlowMatchingPolicy(nn.Module):
     def _get_obs(self, observation: Any):
         return self.obs_encoder._get_obs(observation)
 
-    def _encode_observation(self, observation: Any) -> torch.Tensor:
+    def _encode_observation(self, observation: Any):
         return self.obs_encoder(observation)  # (B, obs_dim)
 
     def _denoise_step(
         self,
-        obs_emb: torch.Tensor,  # (B, obs_dim)
-        x_t: torch.Tensor,      # (B, H, action_dim)
-        t: torch.Tensor,        # (B,)
+        obs: torch.Tensor,  # (B, obs_dim)
+        x_t: torch.Tensor,  # (B, H, action_dim)
+        t: torch.Tensor,    # (B,)
     ) -> torch.Tensor:
-        return self.denoiser(obs_emb, x_t, t)  # (B, H, action_dim)
+        return self.denoiser(obs, x_t, t)
 
     @staticmethod
     def sample_noise(shape: tuple, device: torch.device) -> torch.Tensor:
@@ -697,8 +888,16 @@ class MultiCamTransformerFlowMatchingPolicy(nn.Module):
         Returns:
             actions (B, H, action_dim)
         """
-        _, state, _ = self._get_obs(observation)
-        b = state.shape[0]
+        images, state, _ = self._get_obs(observation)
+        if state is not None:
+            b = state.shape[0]
+        else:
+            if len(images) == 0:
+                raise ValueError("images must be non-empty to infer batch size when state is None")
+            first_img = next(iter(images.values()))
+            if not isinstance(first_img, torch.Tensor):
+                raise TypeError(f"image tensor must be torch.Tensor, got {type(first_img)}")
+            b = first_img.shape[0]
 
         if noise is None:
             noise = self.sample_noise(

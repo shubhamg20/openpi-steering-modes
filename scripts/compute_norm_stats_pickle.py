@@ -47,12 +47,25 @@ def compute_stats_from_pickle_files(
     for task_dir in sorted(root.iterdir()):
         if not task_dir.is_dir():
             continue
-        files = sorted(task_dir.glob("*_noise.pkl"))
+        # files = sorted(task_dir.glob("*_pi0-droid_noise.pkl"))
+        # files = sorted(task_dir.glob("*_pi0-droid_with_prompts_noise.pkl"))
+        # files = sorted(task_dir.glob("*_pi0-droid-no-lang_noise.pkl"))
+        # files = sorted(task_dir.glob("*_pi0-droid-no-lang-discrete-timestep_noise_40000.pkl"))
+        files = sorted(task_dir.glob("*_pi0-droid-no-lang-discrete-timestep_noise_99999.pkl"))
+        # files = sorted(task_dir.glob("*_pi0-droid-with-prompts-discrete-timestep_noise_40000.pkl"))
+
+        print(f"Found {len(files)} episode files in {task_dir}")
         for episode_pkl in files:
             try:
                 with smart_open.open(str(episode_pkl), "rb") as f:
                     data = pickle.load(f)
-                episode_len = len(data["robot"]["timesteps"])
+                if "robot" in data and "timesteps" in data["robot"]:
+                    episode_len = len(data["robot"]["timesteps"])
+                elif "timesteps" in data:
+                    episode_len = len(data["timesteps"])
+                else:
+                    raise ValueError(f"Could not determine episode length for {episode_pkl}")
+                
                 episode_paths.append(str(episode_pkl))
                 episode_lengths.append(episode_len)
             except Exception as e:
@@ -80,19 +93,22 @@ def compute_stats_from_pickle_files(
             print(f"Warning: failed to load {episode_path}: {e}")
             continue
         t1 = time.time()
-        robot_timesteps = episode_data["robot"]["timesteps"]
-        human_timesteps = episode_data["human"]["timesteps"]
+        if "robot" in episode_data and "timesteps" in episode_data["robot"]:
+            robot_timesteps = episode_data["robot"]["timesteps"]
+        elif "timesteps" in episode_data:
+            robot_timesteps = episode_data["timesteps"]
+        else:
+            raise ValueError(f"Could not find timesteps in episode data at {episode_path}")
+        # human_timesteps = episode_data["human"]["timesteps"]
         episode_len = len(robot_timesteps)
         t2 = time.time()
-        human_traj = np.stack([np.array(ts["hand_pose"]) for ts in human_timesteps], axis=0)
-        if human_traj.shape[0] < 110:
-            last_pose = np.array(human_timesteps[-1]["hand_pose"])
-            pad_count = 110 - human_traj.shape[0]
-            pad_vals = np.repeat(last_pose[None, :], pad_count, axis=0)
-            human_traj = np.concatenate([human_traj, pad_vals], axis=0)
-        t3 = time.time()
-
-
+        # human_traj = np.stack([np.array(ts["hand_pose"]) for ts in human_timesteps], axis=0)
+        # if human_traj.shape[0] < 110:
+        #     last_pose = np.array(human_timesteps[-1]["hand_pose"])
+        #     pad_count = 110 - human_traj.shape[0]
+        #     pad_vals = np.repeat(last_pose[None, :], pad_count, axis=0)
+        #     human_traj = np.concatenate([human_traj, pad_vals], axis=0)
+        # t3 = time.time()
 
         # Batch all states and actions for this episode
         states = []
@@ -103,17 +119,18 @@ def compute_stats_from_pickle_files(
             state = np.concatenate([
                 joint_pos,
                 gripper_pos,
-                human_traj.flatten()
+                # human_traj.flatten()
             ])
             states.append(state)
             action = np.concatenate([
-                np.array(robot_timesteps[t]["action"]["robot_state"]["joint_positions"]),
-                np.array([robot_timesteps[t]["action"]["robot_state"]["gripper_position"]])
+                np.array(robot_timesteps[t]["action"]["joint_velocity"]),
+                np.array([robot_timesteps[t]["action"]["target_gripper_position"]])
             ])
             actions.append(action)
 
         states = np.stack(states, axis=0)
         actions = np.stack(actions, axis=0)
+        t3 = time.time()
         stats["state"].update(states)
         num_samples["state"] += states.shape[0]
         stats["actions"].update(actions)
@@ -173,3 +190,4 @@ if __name__ == "__main__":
     tyro.cli(main)
 
 
+#uv run scripts/compute_norm_stats_pickles.py  --config-name pi0_droid_lora_finetune_data --extra-keys noise_action --root-dir /gpfs/projects/weirdlab/shubham/openpi-steering-modes/data/data_paired_droid

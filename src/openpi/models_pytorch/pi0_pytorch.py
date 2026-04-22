@@ -120,7 +120,9 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
-
+        self.num_timestep_buckets = 1000
+        self.timestep_type = getattr(config, "timestep_type", "continuous")
+        print("👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻Using timestep_type:👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻", self.timestep_type)
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
@@ -388,6 +390,10 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        if self.timestep_type == "discrete":
+            # Discretize time to integer bucket indices, then cast back to float for posemb_sincos
+            time = (time * self.num_timestep_buckets).to(torch.int32).to(torch.float32)
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_embs = prefix_embs.clone()
         # Ensure dtype matches model weights (bfloat16 or float32)
@@ -470,8 +476,14 @@ class PI0Pytorch(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        
         while time >= -dt / 2:
-            expanded_time = time.expand(bsize)
+            time_discrete = time
+            if self.timestep_type == "discrete":
+                # Discretize time to integer bucket indices, then cast back to float for posemb_sincos
+                time_discrete = (time * self.num_timestep_buckets).to(torch.int32).to(torch.float32)
+
+            expanded_time = time_discrete.expand(bsize)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -515,7 +527,11 @@ class PI0Pytorch(nn.Module):
         x_t = action
         time = torch.tensor(0.0, dtype=torch.float32, device=device)
         while time < 1 - dt / 2:
-            expanded_time = time.expand(bsize)
+            time_discrete = time
+            if self.timestep_type == "discrete":
+                # Discretize time to integer bucket indices, then cast back to float for posemb_sincos
+                time_discrete = (time * self.num_timestep_buckets).to(torch.int32).to(torch.float32)
+            expanded_time = time_discrete.expand(bsize)
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -534,7 +550,7 @@ class PI0Pytorch(nn.Module):
         device,
         observation,
         action,
-        num_steps: int = 10,
+        num_steps: int = 100,
         num_fp_iters: int = 8,
         tol: float | None = None,
     ) -> torch.Tensor:
@@ -574,7 +590,9 @@ class PI0Pytorch(nn.Module):
         while time < 1 - dt/2:
             # next time is a tensor too
             t_next = (time + dt).expand(bsize)
-
+            time_next_discrete = t_next
+            if self.timestep_type == "discrete":
+                time_next_discrete = (t_next * self.num_timestep_buckets).to(torch.int32).to(torch.float32)
             # fixed-point iteration to solve x_new = x_t + dt*v(x_new, t_next)
             x_new = x_t.clone()
             for i in range(num_fp_iters):
@@ -585,7 +603,7 @@ class PI0Pytorch(nn.Module):
                     prefix_pad_masks,
                     past_key_values,
                     x_new,
-                    t_next,    # NOTE: implicit uses t_next, not time
+                    time_next_discrete,    # NOTE: implicit uses t_next, not time
                 )
                 v_t = v_t.clone()
                 x_new = x_t + dt * v_t
@@ -770,9 +788,35 @@ class PI0Pytorch(nn.Module):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
 
+        # Match the training forward's dtype cast: suffix_embs come from float32 action
+        # projections but paligemma_with_expert's Gemma expert runs in bfloat16.
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
+
+        # DynamicCache.update() accumulates tokens in-place even when use_cache=False.
+        # In the fixed-point loop, each call would grow the cache by suffix_len, so by
+        # iteration N the KV tensors are prefix_len + N*suffix_len long while the
+        # attention mask stays prefix_len + suffix_len — causing a size mismatch.
+        # Build a fresh cache object sliced to exactly prefix_len so the original
+        # cache is never mutated across fixed-point iterations.
+        if (
+            past_key_values is not None
+            and hasattr(past_key_values, "key_cache")
+            and hasattr(past_key_values.__class__, "from_legacy_cache")
+        ):
+            trimmed_legacy_cache = tuple(
+                (k[:, :, :prefix_len, :], v[:, :, :prefix_len, :])
+                for k, v in zip(past_key_values.key_cache, past_key_values.value_cache)
+            )
+            past_key_values = past_key_values.__class__.from_legacy_cache(trimmed_legacy_cache)
+
 
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 

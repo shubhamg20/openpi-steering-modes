@@ -67,6 +67,9 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.timestep_type = getattr(config, "timestep_type", "continuous")
+        print("👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻Using timestep_type👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻👻", self.timestep_type)
+        self.num_timestep_buckets = 1000
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -199,6 +202,10 @@ class Pi0(_model.BaseModel):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
+        if self.timestep_type == "discrete":
+            # Discretize time to integer bucket indices, then cast back to float for posemb_sincos
+            time = (time * self.num_timestep_buckets).astype(jnp.int32).astype(jnp.float32)
+
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
@@ -240,8 +247,12 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
+            time_discrete = time
+            if self.timestep_type == "discrete":
+                # Discretize time to integer bucket indices, matching compute_loss
+                time_discrete = (jnp.broadcast_to(time, batch_size) * self.num_timestep_buckets).astype(jnp.int32).astype(jnp.float32)
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
+                observation, x_t, jnp.broadcast_to(time_discrete, batch_size)
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other

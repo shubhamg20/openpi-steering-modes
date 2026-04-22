@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--data_root",
-        default=os.environ.get("ACT_DATA_ROOT", "/gscratch/weirdlab/shubham2/IsaacLab/source/recorded_runs/data_paired_droid"),
+        default=os.environ.get("ACT_DATA_ROOT", "/gpfs/scrubbed/shubham/data/data_paired_droid"),
         help="Override ACT_DATA_ROOT for loading the dataset.",
     )
     parser.add_argument(
@@ -145,6 +145,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Shard id in [0, num_shards) for this process.",
     )
+    # parser.add_argument(
+    #     "--skip_if_newer_than",
+    #     type=str,
+    #     default=None,
+    #     help="Skip episodes whose output pkl already exists and was modified after this date (e.g. '2025-04-17'). "
+    #          "Useful to re-run only stale files.",
+    # )
     parser.add_argument(
         "--cycle_verify",
         action="store_true",
@@ -513,7 +520,21 @@ def main() -> None:
             episode_path = episode_rel_path
 
         episode_path = Path(episode_paths[episode_idx])
-        output_path = episode_path.parent / (episode_path.stem + "_noise.pkl")
+        # output_path = episode_path.parent / (episode_path.stem + "_pi0-droid_noise.pkl")
+        # output_path = episode_path.parent / (episode_path.stem + "_pi0-droid_with_prompts_noise.pkl")
+        # output_path = episode_path.parent / (episode_path.stem + "_pi0-droid-no-lang_noise.pkl")
+        # output_path = episode_path.parent / (episode_path.stem + "_pi0-droid-no-lang-discrete-timestep_noise_40000.pkl")
+        output_path = episode_path.parent / (episode_path.stem + "_pi0-droid-no-lang-discrete-timestep_noise_99999.pkl")
+        # output_path = episode_path.parent / (episode_path.stem + "_pi0-droid-with-prompts-discrete-timestep_noise_40000.pkl")
+        # output_path = episode_path.parent / (episode_path.stem + "_pi0-droid-with-prompts-discrete-timestep_noise_99999.pkl")
+
+        # if args.skip_if_newer_than and output_path.exists():
+        #     import datetime
+        #     cutoff = datetime.datetime.strptime(args.skip_if_newer_than, "%Y-%m-%d").timestamp()
+        #     mtime_utc = output_path.stat().st_mtime
+        #     if mtime_utc >= cutoff:
+        #         print(f"[skip] {output_path.name} is newer than {args.skip_if_newer_than}, skipping.")
+        #         continue
 
         with open(episode_path, "rb") as f:
             data = pickle.load(f)

@@ -319,10 +319,16 @@ def restore_params(
             ocp.args.PyTreeRestore(
                 item=item,
                 restore_args=jax.tree.map(
-                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
+                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type), item
                 ),
             ),
         )["params"]
+
+    if dtype is not None:
+        params = jax.tree.map(
+            lambda x: x.astype(dtype) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
+            params,
+        )
 
     # If the params were saved with `save_state` during openpi training, every key path will end with "value", which is
     # added by `nnx.State`. We remove the "value" suffix here and always return what NNX calls a "pure dict".
