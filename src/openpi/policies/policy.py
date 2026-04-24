@@ -66,6 +66,9 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # Extract invert before transform since it's not a model key and would be dropped.
+        invert = obs.get("invert", False)
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -93,13 +96,49 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
+        logging.info(f"[policy.infer] invert={invert}, inputs keys={list(inputs.keys())}")
+        if invert:
+            # Use transformed actions (normalized + padded) from inputs
+            actions = inputs.get("actions")
+            logging.info(f"[policy.infer] actions shape={getattr(actions, 'shape', None)}")
+            if actions is None:
+                logging.warning("invert=True but no 'actions' found in inputs, skipping inversion")
+            else:
+                if not self._is_pytorch_model:
+                    self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+                target_noise = self._model._invert_actions(
+                    sample_rng_or_pytorch_device,
+                    observation,
+                    actions,
+                    **sample_kwargs,
+                )
+                outputs["target_noise"] = target_noise
+
+                if not self._is_pytorch_model:
+                    self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
+                # reconstruct actions from target_noise to verify correctness
+                reconstructed_actions = self._sample_actions(
+                    sample_rng_or_pytorch_device,
+                    observation,
+                    noise=target_noise,
+                    **sample_kwargs,
+                )
+                outputs["reconstructed_actions"] = reconstructed_actions
         model_time = time.monotonic() - start_time
+
+        # Preserve inversion outputs before output_transform (LiberoOutputs replaces the dict)
+        extra_keys = {k: outputs[k] for k in ("reconstructed_actions", "target_noise") if k in outputs}
+
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+
+        # Re-add inversion outputs stripped by output_transform
+        for k, v in extra_keys.items():
+            outputs[k] = jax.tree.map(lambda x: np.asarray(x[0, ...]), v)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

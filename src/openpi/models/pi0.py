@@ -290,3 +290,61 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    @override
+    def _invert_actions(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 100,
+        fixed_point_iters: int = 4,
+    ) -> at.Float[at.Array, "b ah ad"]:
+        observation = _model.preprocess_observation(None, observation, train=False)
+        print(num_steps)
+        dt = 1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        x_k = actions  # x_0 (data)
+
+        # first fill KV cache with a forward pass of the prefix
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def v_theta(x, time_scalar):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x, jnp.broadcast_to(time_scalar, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out is None
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+        def one_step(carry, k):
+            x_k = carry
+            t_k1 = (k + 1) * dt  # tk+1
+
+            # Implicit Euler: x_{k+1} = x_k + dt * v(x_{k+1}, t_{k+1})
+            def fp_body(x_guess, _):
+                return x_k + dt * v_theta(x_guess, t_k1), None
+
+            x_guess0 = x_k
+            x_k1, _ = jax.lax.scan(fp_body, x_guess0, xs=None, length=fixed_point_iters)
+            return x_k1, None
+
+        x_1, _ = jax.lax.scan(one_step, x_k, jnp.arange(num_steps))
+        return x_1
+
